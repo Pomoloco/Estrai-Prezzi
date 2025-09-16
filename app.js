@@ -66,10 +66,17 @@ async function runOCR(file, {model, psm, numericPass}) {
     const w = await getWorker(model);
     const cfg = { 'tessedit_pageseg_mode': parseInt(psm,10) || 4 };
     // Blob per evitare problemi WebKit con URL.createObjectURL in contesto worker
-    lastBlob = await fileToBlob(file);
-    log('PROCESS', file.name, file.type);
+    // Se arriva un File, usalo direttamente. Se è Blob, wrappalo in File.
+let inputFile;
+if (file instanceof File) {
+  inputFile = file;
+} else {
+  const blob = await fileToBlob(file);
+  inputFile = new File([blob], 'input.png', { type: file.type || 'image/png' });
+}
+log('PROCESS', inputFile.name, inputFile.type);
 
-    const r1 = await w.recognize(lastBlob, { tessjs_create_hocr: '0', ...cfg });
+const r1 = await w.recognize(inputFile, { tessjs_create_hocr: '0', ...cfg });
     const text1 = (r1 && r1.data && r1.data.text) ? r1.data.text : '';
     $('#raw').value = text1;
 
