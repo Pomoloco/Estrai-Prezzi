@@ -1,93 +1,43 @@
-(function(){
-  const PRICE_RE=/(?:€\s*)?(\d{1,3}(?:[.\s]\d{3})*(?:[.,]\d{2})|\d+[.,]\d{2})(?!\d)/g;
-  const VAT_RE=/\b(?:iva\s*[:\-]?\s*)?(0?4(?:[.,]0)?|0?5(?:[.,]0)?|10(?:[.,]0)?|22(?:[.,]0)?)\s*%?\b/i;
+// Parser semplice: cerca righe con descrizione + numeri tipici "prezzo" e "iva"
+// Miglioreremo per fornitore (Bianchin, Pittoni, Berica, OROFRUIT) quando ci confermi la stabilità OCR.
+(function(global){
+  function norm(s){ return (s||'').replace(/\u00A0/g,' ').replace(/[^\S\r\n]+/g,' ').trim(); }
 
-  function normPrice(s){
-    if(!s) return null;
-    let x=String(s).replace(/[€\s]/g,'');
-    if(x.includes('.')&&x.includes(',')) x=x.replace(/\./g,'').replace(',', '.');
-    else if(x.includes(',')) x=x.replace(',', '.');
-    const n=parseFloat(x);
-    return Number.isFinite(n)?n:null;
-  }
-  function normVat(tok){
-    if(!tok) return null;
-    const n=parseInt(String(tok).replace(/[^\d]/g,''),10);
-    const v=n%100;
-    return [4,5,10,22].includes(v)?v:null;
-  }
-  function findAll(re,str){
-    const out=[]; re.lastIndex=0; let m;
-    while((m=re.exec(str))!==null){ out.push({i:m.index,raw:m[0],val:m[1]||m[0]}); }
-    re.lastIndex=0; return out;
-  }
-  function isNoise(l){
-    const low=l.toLowerCase();
-    if(low.length<6) return true;
-    if(/\b(totale|imponibile|imposta|documento|iban|annotazioni|firma|vettore|destinatario|saldo|trasporto|legenda|codici iva)\b/i.test(low)) return true;
-    return false;
-  }
-  function detectSupplier(t){
-    t=t.toLowerCase();
-    if(t.includes('bianchin')) return 'BIANCHIN';
-    if(t.includes('pittoni')) return 'PITTONI';
-    if(t.includes('berica') && t.includes('funghi')) return 'BERICA_FUNGHI';
-    if(t.includes('orofruit')) return 'OROFRUIT';
-    return null;
-  }
+  function parse(text){
+    const out = [];
+    if(!text) return out;
 
-  function parseProducts(fullText){
-    const supplier=detectSupplier(fullText);
-    const lines=fullText.split(/\r?\n/).map(s=>s.replace(/\s{2,}/g,' ').trim()).filter(Boolean);
-    const items=[];
-    for(const line of lines){
-      if(isNoise(line)) continue;
-      if(!/\d/.test(line)) continue;
+    // Uniamo righe spezzate e filtriamo righe ovviamente non di corpo tabella
+    const lines = text.split(/\r?\n/).map(norm).filter(Boolean)
+      .filter(l => !/^VIA |^Codice Fiscale|^C\.\s*S\.|^IBAN|^TIPO DOCUMENTO|^DOCUMENTO DI|^PAGATO|^NUMERO DOCUMENTO|^DATA DOC|^TOTALE|^IMBALL|^CAUSALE|^TRASPORTO|^Le merci|^Assolve|^La durata|^Agrumi|^Il pagamento|^L' Azienda/i.test(l));
 
-      const vatToks=findAll(VAT_RE,line);
-      const lastVat=vatToks.length?vatToks[vatToks.length-1]:null;
-      const vatVal=lastVat?normVat(lastVat.val):null;
+    // Pattern numeri (prezzi) tipo "1,600" "59,04" ecc. e IVA 4/22
+    const rePrezzo = /(\d{1,3}(?:[.,]\d{3})*[.,]\d{2,3}|\d{1,3}[.,]\d{3})\b/;
+    const reIva = /\b(4|22|10)\b/;
 
-      const prices=findAll(PRICE_RE,line).map(p=>({...p,num:normPrice(p.val)}));
-      if(!prices.length) continue;
+    for (const l of lines){
+      // Trova l'ultimo numero "in stile prezzo" nella riga
+      const matches = [...l.matchAll(rePrezzo)].map(m=>m[1]);
+      if(matches.length===0) continue;
+      const prezzo = matches[matches.length-1];
 
-      let chosen=prices[prices.length-1];
-      const leftOfVat=lastVat?prices.filter(p=>p.i<lastVat.i):prices;
+      // IVA (se presente) alla fine riga
+      const ivaMatch = l.match(/(\b4\b|\b22\b|\b10\b)\s*$/);
+      const iva = ivaMatch ? ivaMatch[1] : '';
 
-      if(supplier==='BIANCHIN'){
-        if(leftOfVat.length) chosen=leftOfVat[leftOfVat.length-1];
-      } else if(supplier==='OROFRUIT'){
-        if(leftOfVat.length) chosen=leftOfVat.sort((a,b)=>a.num-b.num)[0];
-      } else if(supplier==='PITTONI'){
-        if(lastVat&&leftOfVat.length){
-          leftOfVat.sort((a,b)=>Math.abs(lastVat.i-a.i)-Math.abs(lastVat.i-b.i));
-          chosen=leftOfVat[0];
-        }
-      } else if(supplier==='BERICA_FUNGHI'){
-        if(leftOfVat.length) chosen=leftOfVat[leftOfVat.length-1];
-      } else {
-        if(lastVat&&leftOfVat.length){
-          leftOfVat.sort((a,b)=>Math.abs(lastVat.i-a.i)-Math.abs(lastVat.i-b.i));
-          chosen=leftOfVat[0];
-        }
-      }
+      // Descrizione: inizio riga fino al primo numero plausibile
+      const firstNum = l.search(rePrezzo);
+      let desc = firstNum>0 ? l.slice(0, firstNum).trim() : l;
+      // pulizie tipiche
+      desc = desc.replace(/^[\|\-·•\s]+/,'').replace(/\s{2,}/g,' ');
 
-      let name=line.slice(0, chosen.i).trim();
-      name=name.replace(/\b(art\.?|cod\.?|lotto|iso|cal|cat|colli?|lordo|tara|netto|kg|ct|pz|u\.?m\.?|p\.?\s*lordo\/?pz|p\.?\s*netto|uom)\b.*$/i,' ')
-               .replace(/[|•·\-–—]+/g,' ')
-               .replace(/\s{2,}/g,' ')
-               .trim();
-      if(!name || name.length<3) continue;
+      // scarta righe troppo corte o troppo numeriche
+      if(desc.length<3 || /^\d+$/.test(desc)) continue;
 
-      items.push({ name, price: chosen.num, vat: vatVal });
+      out.push({ desc, prezzo, iva });
     }
-
-    const map=new Map();
-    for(const it of items){
-      map.set(`${it.name.toLowerCase()}|${it.vat??''}`, it);
-    }
-    return [...map.values()];
+    return out;
   }
 
-  window.__estrai_parseProducts = parseProducts;
-})();
+  global.parseDescrPrezziIva = parse;
+})(window);
