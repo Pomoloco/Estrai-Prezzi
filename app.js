@@ -81,50 +81,89 @@ async function runNoWorker(inputFile, cfg){
 }
 
 // ========= OCR =========
-async function runOCR(file, {model, psm, numericPass}) {
+// --- utili ---
+const log = (...a) => { const el = document.querySelector('#log'); el.textContent += a.join(' ') + '\n'; el.scrollTop = el.scrollHeight; };
+const setErr = (m)=>{ const e=document.querySelector('#error'); if(!m){e.hidden=true;e.textContent='';} else {e.hidden=false;e.textContent=m;} };
+const setProg = (p)=>{ document.querySelector('#progress span').style.width = (Math.max(0,Math.min(1,p))*100)+'%'; };
+
+// --- CDN fissi, Safari-safe (tesseract v2.1.5) ---
+const paths = {
+  workerPath: 'https://cdn.jsdelivr.net/npm/tesseract.js@2.1.5/dist/worker.min.js',
+  corePath:   'https://cdn.jsdelivr.net/npm/tesseract.js-core@2.2.0/tesseract-core.wasm.js',
+  langBest:   'https://tessdata.projectnaptha.com/4.0.0_best'
+};
+
+let worker = null;
+async function getWorker() {
+  if (worker) return worker;
+  worker = Tesseract.createWorker({
+    workerPath: paths.workerPath,
+    corePath: paths.corePath,
+    langPath: paths.langBest,
+    logger: m => { if (m.status==='recognizing text' && m.progress!=null) setProg(m.progress); if (m.status) log('OCR:', m.status, m.progress ?? ''); }
+  });
+  await worker.load();
+  await worker.loadLanguage('ita+eng');
+  await worker.initialize('ita+eng');
+  log('OCR: initialized api');
+  return worker;
+}
+
+// Riduce e converte a PNG per evitare OOM del WASM
+async function preprocessImage(file, maxDim=2000) {
+  const f = (file instanceof File) ? file : new File([file], 'input.jpg', {type:'image/jpeg'});
+  const bmp = await createImageBitmap(f);
+  const scale = Math.min(1, maxDim / Math.max(bmp.width, bmp.height));
+  const w = Math.round(bmp.width*scale), h = Math.round(bmp.height*scale);
+  const canvas = document.createElement('canvas'); canvas.width=w; canvas.height=h;
+  const ctx = canvas.getContext('2d', { willReadFrequently:true });
+  ctx.drawImage(bmp, 0, 0, w, h);
+  const blob = await new Promise(res=>canvas.toBlob(res, 'image/png'));
+  const out = new File([blob], (f.name||'input')+'.png', {type:'image/png'});
+  log('Preprocess:', f.name, '→', out.name, `(${w}x${h})`);
+  return out;
+}
+
+// OCR con worker + fallback no-worker
+async function runOCR(input, psm=4) {
+  setErr(''); setProg(0);
+  const img = await preprocessImage(input, 2000);
+  const cfg = { 'tessedit_pageseg_mode': parseInt(psm,10)||4, tessjs_create_hocr: '0' };
+
   try {
-    setErr(''); setProg(0);
-    $('#raw').value = '';
-    $('#outTable tbody').innerHTML = '';
-    $('#csvBtn').disabled = true;
-
-    // 1) Preprocess immagine
-    let inputFile;
-    if (file instanceof File) inputFile = file;
-    else inputFile = new File([file], 'input.jpg', {type: 'image/jpeg'});
-
-    inputFile = await preprocessImage(inputFile, 2000);
-
-    const cfg = { 'tessedit_pageseg_mode': parseInt(psm,10) || 4 };
-
-    log('PROCESS', inputFile.name, inputFile.type);
-
-    // 2) Prova con worker
-    let result;
-    try {
-      result = await runWithWorker(inputFile, cfg);
-    } catch (err) {
-      log('Worker OCR error:', err?.message || err);
-      // 3) Fallback automatico
-      result = await runNoWorker(inputFile, cfg);
-    }
-
-    const text1 = result?.data?.text || '';
-    $('#raw').value = text1;
-
-    // Parser base: popola tabella se trova prezzi/iva
-    const rows = window.parseDescrPrezziIva(text1);
-    renderRows(rows);
-
-  } catch (err) {
-    setErr('Errore: ' + (err?.message || err));
-    log('FATAL', err?.stack || err);
+    const w = await getWorker();
+    log('PROCESS', img.name, img.type);
+    const r = await w.recognize(img, cfg);
+    return r.data.text || '';
+  } catch (e) {
+    log('Worker OCR error:', e?.message || e);
+    // Fallback più stabile su iOS
+    log('Fallback: single-thread (no worker)…');
+    const r = await Tesseract.recognize(img, 'ita+eng', {
+      corePath: paths.corePath,
+      langPath: paths.langBest,
+      logger: m => { if (m.status==='recognizing text' && m.progress!=null) setProg(m.progress); if (m.status) log('OCR(no-worker):', m.status, m.progress ?? ''); },
+      ...cfg
+    });
+    return r.data.text || '';
   } finally {
     setProg(1);
   }
 }
 
-// ========= UI =========
+// Handler bottone
+document.querySelector('#goBtn').addEventListener('click', async ()=>{
+  try{
+    const file = document.querySelector('#file').files?.[0];
+    if(!file){ setErr('Seleziona un file.'); return; }
+    const text = await runOCR(file, document.querySelector('#psm').value);
+    document.querySelector('#raw').value = text;
+    // TODO: invoca il parser qui quando vuoi
+  } catch(err){
+    setErr('Errore: '+(err?.message||err));
+    log('FATAL', err?.stack||err);
+  }
+});// ========= UI =========
 $('#goBtn').addEventListener('click', async () => {
   const file = $('#file').files?.[0];
   if(!file){ setErr('Seleziona un file immagine o PDF.'); return;}
