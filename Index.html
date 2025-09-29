@@ -1,70 +1,73 @@
 <!doctype html>
 <html lang="it">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>EstrAI prezzi — OCR stabile (Safari iOS)</title>
-  <link rel="stylesheet" href="styles.css">
-  <!-- Tesseract.js v2.1.5 (stabile per Safari iOS) -->
-  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@2.1.5/dist/tesseract.min.js"></script>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Storico & Confronto Prezzi — WebApp</title>
+  <link rel="stylesheet" href="styles.css" />
+  <!-- SheetJS (XLSX) -->
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <!-- pdf.js -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 </head>
 <body>
-  <main class="container">
-    <h1>EstrAI prezzi — (Descrizione, Prezzo, IVA)</h1>
-    <p class="subtitle">Tesseract.js 2.1.5 • Safari iOS compatibile • nessun server</p>
+  <header>
+    <h1>Storico & Confronto Prezzi</h1>
+    <p class="sub">Carica fatture PDF → Estrazione completa → Storico cumulativo → Confronto prezzi → Export Excel</p>
+  </header>
 
-    <div class="row">
-      <input id="file" type="file" accept="image/*,.pdf">
-      <button id="goBtn">Carica / OCR</button>
-      <button id="demoBtn" class="ghost">Usa demo</button>
-    </div>
-
-    <div class="row options">
-      <label>Modello OCR:
-        <select id="model">
-          <option value="best" selected>tessdata_best (accurato)</option>
-          <option value="fast">tessdata_fast (veloce)</option>
-        </select>
-      </label>
-      <label>PSM:
-        <select id="psm">
-          <option value="4">4 (colonne)</option>
-          <option value="6">6 (righe/colonne)</option>
-          <option value="3">3 (paragrafo)</option>
-        </select>
-      </label>
-      <label class="chk">
-        <input id="numericPass" type="checkbox">
-        Secondo pass numerico (opzionale)
-      </label>
-    </div>
-
-    <div id="error" class="error" hidden></div>
-    <div id="progress" class="progress"><span></span></div>
-
-    <section class="panel">
-      <h2>Risultati (Descrizione | Prezzo | IVA)</h2>
-      <table id="outTable">
-        <thead><tr><th>#</th><th>Descrizione</th><th>Prezzo (€)</th><th>IVA (%)</th></tr></thead>
-        <tbody></tbody>
-      </table>
-      <button id="csvBtn" class="ghost" disabled>Esporta CSV</button>
+  <main>
+    <section class="card">
+      <h2>1) Carica fatture PDF</h2>
+      <input type="file" id="pdfInput" accept="application/pdf" multiple />
+      <div class="row">
+        <label>Fornitore:</label>
+        <input type="text" id="supplier" placeholder="Es. Brendolan Alimentari SRL" />
+      </div>
+      <div class="row">
+        <button id="btnParse">Estrai prodotti</button>
+        <button id="btnClearLast">Annulla ultima importazione</button>
+        <button id="btnResetAll" class="danger">Azzeramento completo</button>
+      </div>
+      <p class="hint">La data documento viene letta dal PDF (se presente nel testo o nel nome file). In alternativa puoi impostarla manualmente dal pannello avanzato.</p>
+      <details class="advanced">
+        <summary>Opzioni avanzate</summary>
+        <div class="row">
+          <label>Data documento (override):</label>
+          <input type="date" id="manualDate" />
+        </div>
+        <div class="row">
+          <label>Regex riga prodotto (avanzato):</label>
+          <input type="text" id="rowRegex" value="^(\d{5,7})\s+(.+?)\s+(\d+[\.,]\d{2})$" />
+        </div>
+        <p class="hint">Il parser predefinito riconosce righe tipo: <code>806133  ACQUA GOCCIA ...  0,94</code></p>
+      </details>
     </section>
 
-    <details class="panel">
-      <summary>Testo OCR grezzo</summary>
-      <textarea id="raw" rows="14" spellcheck="false"></textarea>
-    </details>
+    <section class="card">
+      <h2>2) Risultati ultimo documento</h2>
+      <div id="lastDocMeta"></div>
+      <div id="tableLastDoc" class="table-wrap"></div>
+    </section>
 
-    <details class="panel">
-      <summary>Log</summary>
-      <pre id="log"></pre>
-    </details>
+    <section class="card">
+      <h2>3) Storico cumulativo (localStorage)</h2>
+      <div class="row">
+        <button id="btnExportExcel">Esporta Excel (3 fogli con auto-fit)</button>
+      </div>
+      <div id="tableHistory" class="table-wrap"></div>
+    </section>
 
-    <footer>Client-side • Tesseract.js v2 • PDF.js opzionale (aggiungibile) • Debug log in pagina</footer>
+    <section class="card">
+      <h2>4) Confronto prezzi (solo variazioni + nuovi)</h2>
+      <div id="tableDelta" class="table-wrap"></div>
+    </section>
   </main>
 
-  <script src="parser.js"></script>
+  <footer>
+    <small>© 2025 — WebApp statica pronta per Netlify. I dati sono salvati nel tuo browser (localStorage).</small>
+  </footer>
+
   <script src="app.js"></script>
 </body>
 </html>
