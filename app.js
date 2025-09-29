@@ -1,206 +1,291 @@
-// ========= UTIL =========
-const $ = s => document.querySelector(s);
-const log = (...a) => { const el = $('#log'); el.textContent += a.join(' ') + '\n'; el.scrollTop = el.scrollHeight; };
-const setErr = (msg) => { const e = $('#error'); if(!msg){e.hidden=true; e.textContent='';} else {e.hidden=false; e.textContent=msg;} };
-const setProg = (p) => { $('#progress span').style.width = `${Math.max(0,Math.min(1,p))*100}%`; };
+// ===== Helpers =====
+const $  = sel => document.querySelector(sel);
+const $$ = sel => Array.from(document.querySelectorAll(sel));
 
-// ========= TESSERACT v2 CONFIG (Safari iOS safe) =========
-const paths = {
-  workerPath: 'https://cdn.jsdelivr.net/npm/tesseract.js@2.1.5/dist/worker.min.js',
-  corePath:   'https://cdn.jsdelivr.net/npm/tesseract.js-core@2.2.0/tesseract-core.wasm.js',
-  langBase:   {
-    best: 'https://tessdata.projectnaptha.com/4.0.0_best',
-    fast: 'https://tessdata.projectnaptha.com/4.0.0_fast'
+function toNumberEU(str) {
+  if (str == null) return null;
+  const s = String(str).trim().replace(/\./g, '').replace(',', '.');
+  const n = Number(s);
+  return isFinite(n) ? n : null;
+}
+function fmtEUR(n) {
+  if (n == null || !isFinite(n)) return "";
+  return n.toLocaleString('it-IT', { style:'currency', currency:'EUR' });
+}
+function autoTable(el, data) {
+  if (!data || !data.length) { el.innerHTML = "<p class='hint'>Nessun dato.</p>"; return; }
+  const cols = Object.keys(data[0]);
+  const thead = "<thead><tr>" + cols.map(c=>`<th>${c}</th>`).join("") + "</tr></thead>";
+  const tbody = "<tbody>" + data.map(r=>"<tr>"+cols.map(c=>`<td>${r[c] ?? ""}</td>`).join("")+"</tr>").join("") + "</tbody>";
+  el.innerHTML = `<table>${thead}${tbody}</table>`;
+}
+
+// ===== PDF.js setup =====
+pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+// Rebuild lines grouping text items by Y coordinate (tolleranza semplice)
+async function extractTextLinesFromPDF(file) {
+  const arrayBuf = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuf }).promise;
+  const linesAll = [];
+  for (let p = 1; p <= pdf.numPages; p++) {
+    const page = await pdf.getPage(p);
+    const content = await page.getTextContent();
+    const linesMap = new Map();
+    for (const item of content.items) {
+      const ts = item.transform;
+      const y = Math.round(ts[5]);         // coord Y
+      const x = ts[4];                     // coord X
+      const arr = linesMap.get(y) || [];
+      arr.push({ x, s: item.str });
+      linesMap.set(y, arr);
+    }
+    const ys = Array.from(linesMap.keys()).sort((a,b)=>b-a); // top -> bottom
+    for (const y of ys) {
+      const parts = linesMap.get(y).sort((a,b)=>a.x-b.x).map(o=>o.s);
+      const txt = parts.join(" ").replace(/\s+/g, " ").trim();
+      if (txt) linesAll.push(txt);
+    }
   }
-};
+  return linesAll;
+}
 
-let worker = null;
+// Data dal nome file o dal testo (es. 10_04_2025 o 10/04/2025)
+function guessDocDate(filename, lines) {
+  const f = filename.toLowerCase();
+  let m = f.match(/(\d{2})[._-](\d{2})[._-](\d{4})/);
+  if (m) return `${m[3]}-${m[2]}-${m[1]}`;
+  for (const ln of lines) {
+    const t = ln.toLowerCase();
+    const mm = t.match(/(\d{2})[\/.-](\d{2})[\/.-](\d{4})/);
+    if (mm) return `${mm[3]}-${mm[2]}-${mm[1]}`;
+  }
+  const d = new Date();
+  return d.toISOString().slice(0,10);
+}
 
-// ========= WORKER =========
-async function getWorker(model='best') {
-  if (worker) return worker;
-  log('Create worker v2 … model=', model);
-  worker = Tesseract.createWorker({
-    workerPath: paths.workerPath,
-    corePath: paths.corePath,
-    langPath: paths.langBase[model] || paths.langBase.best,
-    logger: m => {
-      if (m.status === 'recognizing text' && m.progress!=null) setProg(m.progress);
-      if (m.status) log('OCR:', m.status, m.progress ?? '');
+// Estrazione delle righe prodotto via regex (personalizzabile in UI)
+function parseRows(lines, rowRegex) {
+  const rx = new RegExp(rowRegex);
+  const rows = [];
+  for (const ln of lines) {
+    const m = ln.match(rx);
+    if (m) {
+      const codice = m[1].trim();
+      const descr  = m[2].trim();
+      const prezzo = toNumberEU(m[3]);
+      rows.push({
+        "Codice": codice,
+        "Descrizione": descr,
+        "Prezzo unitario €": prezzo
+      });
     }
-  });
-  await worker.load();
-  await worker.loadLanguage('ita+eng');
-  await worker.initialize('ita+eng');
-  log('OCR: initialized api');
-  return worker;
+  }
+  return rows;
 }
 
-// ========= IMAGE PRE-PROCESS =========
-// Riduce dimensione e converte in PNG: evita out-of-memory in WASM su iPhone.
-async function preprocessImage(file, maxDim = 2000) {
-  if (!(file instanceof File)) return file;
+// ===== Storage (localStorage) =====
+const STORE_KEY = "storico_cumulativo_v1";
+const IMPORT_LOG = "storico_import_log_v1";
 
-  const bitmap = await createImageBitmap(file);
-  let { width, height } = bitmap;
+function loadStore(){ try { return JSON.parse(localStorage.getItem(STORE_KEY)) || []; } catch { return []; } }
+function saveStore(arr){ localStorage.setItem(STORE_KEY, JSON.stringify(arr)); }
+function loadLog(){ try { return JSON.parse(localStorage.getItem(IMPORT_LOG)) || []; } catch { return []; } }
+function saveLog(arr){ localStorage.setItem(IMPORT_LOG, JSON.stringify(arr)); }
 
-  const scale = Math.min(1, maxDim / Math.max(width, height));
-  const w = Math.round(width * scale);
-  const h = Math.round(height * scale);
-
-  const canvas = document.createElement('canvas');
-  canvas.width = w; canvas.height = h;
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  ctx.drawImage(bitmap, 0, 0, w, h);
-
-  // PNG 0.92 qualità non è usata per PNG ma lasciamo default
-  const blob = await new Promise(res => canvas.toBlob(res, 'image/png', 0.92));
-  const outFile = new File([blob], (file.name || 'input') + '.png', { type: 'image/png' });
-  log('Preprocess:', file.name, '→', outFile.name, `(${w}x${h})`);
-  return outFile;
-}
-
-// ========= OCR RUN WITH FALLBACK =========
-async function runWithWorker(inputFile, cfg){
-  const w = await getWorker($('#model').value);
-  return w.recognize(inputFile, { tessjs_create_hocr: '0', ...cfg });
-}
-
-async function runNoWorker(inputFile, cfg){
-  log('Fallback: single-thread (no worker)…');
-  return Tesseract.recognize(inputFile, 'ita+eng', {
-    corePath: paths.corePath,
-    langPath: paths.langBase[$('#model').value] || paths.langBase.best,
-    workerPath: paths.workerPath, // ignorato in no-worker
-    ...cfg,
-    logger: m => {
-      if (m.status === 'recognizing text' && m.progress!=null) setProg(m.progress);
-      if (m.status) log('OCR(no-worker):', m.status, m.progress ?? '');
-    }
-  });
-}
-
-// ========= OCR =========
-// --- utili ---
-const log = (...a) => { const el = document.querySelector('#log'); el.textContent += a.join(' ') + '\n'; el.scrollTop = el.scrollHeight; };
-const setErr = (m)=>{ const e=document.querySelector('#error'); if(!m){e.hidden=true;e.textContent='';} else {e.hidden=false;e.textContent=m;} };
-const setProg = (p)=>{ document.querySelector('#progress span').style.width = (Math.max(0,Math.min(1,p))*100)+'%'; };
-
-// --- CDN fissi, Safari-safe (tesseract v2.1.5) ---
-const paths = {
-  workerPath: 'https://cdn.jsdelivr.net/npm/tesseract.js@2.1.5/dist/worker.min.js',
-  corePath:   'https://cdn.jsdelivr.net/npm/tesseract.js-core@2.2.0/tesseract-core.wasm.js',
-  langBest:   'https://tessdata.projectnaptha.com/4.0.0_best'
-};
-
-let worker = null;
-async function getWorker() {
-  if (worker) return worker;
-  worker = Tesseract.createWorker({
-    workerPath: paths.workerPath,
-    corePath: paths.corePath,
-    langPath: paths.langBest,
-    logger: m => { if (m.status==='recognizing text' && m.progress!=null) setProg(m.progress); if (m.status) log('OCR:', m.status, m.progress ?? ''); }
-  });
-  await worker.load();
-  await worker.loadLanguage('ita+eng');
-  await worker.initialize('ita+eng');
-  log('OCR: initialized api');
-  return worker;
-}
-
-// Riduce e converte a PNG per evitare OOM del WASM
-async function preprocessImage(file, maxDim=2000) {
-  const f = (file instanceof File) ? file : new File([file], 'input.jpg', {type:'image/jpeg'});
-  const bmp = await createImageBitmap(f);
-  const scale = Math.min(1, maxDim / Math.max(bmp.width, bmp.height));
-  const w = Math.round(bmp.width*scale), h = Math.round(bmp.height*scale);
-  const canvas = document.createElement('canvas'); canvas.width=w; canvas.height=h;
-  const ctx = canvas.getContext('2d', { willReadFrequently:true });
-  ctx.drawImage(bmp, 0, 0, w, h);
-  const blob = await new Promise(res=>canvas.toBlob(res, 'image/png'));
-  const out = new File([blob], (f.name||'input')+'.png', {type:'image/png'});
-  log('Preprocess:', f.name, '→', out.name, `(${w}x${h})`);
-  return out;
-}
-
-// OCR con worker + fallback no-worker
-async function runOCR(input, psm=4) {
-  setErr(''); setProg(0);
-  const img = await preprocessImage(input, 2000);
-  const cfg = { 'tessedit_pageseg_mode': parseInt(psm,10)||4, tessjs_create_hocr: '0' };
-
-  try {
-    const w = await getWorker();
-    log('PROCESS', img.name, img.type);
-    const r = await w.recognize(img, cfg);
-    return r.data.text || '';
-  } catch (e) {
-    log('Worker OCR error:', e?.message || e);
-    // Fallback più stabile su iOS
-    log('Fallback: single-thread (no worker)…');
-    const r = await Tesseract.recognize(img, 'ita+eng', {
-      corePath: paths.corePath,
-      langPath: paths.langBest,
-      logger: m => { if (m.status==='recognizing text' && m.progress!=null) setProg(m.progress); if (m.status) log('OCR(no-worker):', m.status, m.progress ?? ''); },
-      ...cfg
+// Upsert: mantiene l’ultimo prezzo per Codice
+function upsertHistory(rows, meta){
+  const store = loadStore();
+  const byCode = new Map(store.map(r=>[r.Codice, r]));
+  for (const r of rows) {
+    byCode.set(r.Codice, {
+      "Codice": r.Codice,
+      "Descrizione": r.Descrizione,
+      "Prezzo unitario €": r["Prezzo unitario €"],
+      "IVA %": r["IVA %"] ?? "",       // se non disponibile
+      "Data": meta.data,
+      "Fornitore": meta.fornitore
     });
-    return r.data.text || '';
-  } finally {
-    setProg(1);
+  }
+  const updated = Array.from(byCode.values()).sort((a,b)=> a.Codice.localeCompare(b.Codice));
+  saveStore(updated);
+  // per annulla-ultimo
+  const log = loadLog();
+  log.push({ meta, codes: rows.map(r=>r.Codice) });
+  saveLog(log);
+  return updated;
+}
+
+function undoLastImport(){
+  const log = loadLog();
+  if (!log.length) return;
+  const last = log.pop();
+  saveLog(log);
+  const store = loadStore().filter(r => !last.codes.includes(r.Codice));
+  saveStore(store);
+}
+
+// Diff contro snapshot precedente allo (stesso) import
+function diffAgainstSnapshot(prevSnapshot, newRows){
+  const prevBy = new Map(prevSnapshot.map(r=>[r.Codice, r]));
+  const results = [];
+  for (const r of newRows) {
+    const prev = prevBy.get(r.Codice);
+    if (!prev) {
+      results.push({
+        "Codice": r.Codice, "Descrizione": r.Descrizione,
+        "Prezzo precedente €": "", "Prezzo nuovo €": r["Prezzo unitario €"],
+        "Differenza €": "", "Differenza %": "", "Indicatore": "🆕"
+      });
+    } else {
+      const p0 = toNumberEU(prev["Prezzo unitario €"]);
+      const p1 = toNumberEU(r["Prezzo unitario €"]);
+      const diff = p1 - p0;
+      if (Math.abs(diff) > 1e-9) {
+        const pct = p0 ? (diff / p0) * 100 : "";
+        results.push({
+          "Codice": r.Codice, "Descrizione": r.Descrizione,
+          "Prezzo precedente €": p0, "Prezzo nuovo €": p1,
+          "Differenza €": diff, "Differenza %": pct === "" ? "" : pct,
+          "Indicatore": diff > 0 ? "🔴" : "🟢"
+        });
+      }
+    }
+  }
+  // prima le variazioni, poi i nuovi
+  return results.sort((a,b)=>{
+    const aNew = a.Indicatore === "🆕" ? 1 : 0;
+    const bNew = b.Indicatore === "🆕" ? 1 : 0;
+    if (aNew !== bNew) return aNew - bNew;
+    return (a.Descrizione || "").localeCompare(b.Descrizione || "");
+  });
+}
+
+// ===== Excel (SheetJS) con auto-fit =====
+function autoFitCols(json){
+  const cols = Object.keys(json[0] || {});
+  const wch = cols.map(h => Math.max(h.length, 8));
+  json.forEach(row => cols.forEach((c,i) => {
+    const v = row[c] == null ? "" : String(row[c]);
+    wch[i] = Math.max(wch[i], v.length);
+  }));
+  return cols.map((h,i)=>({ wch: wch[i] + 2 }));
+}
+function exportExcel({ lastDocRows, lastDocMeta, historyRows, deltas }){
+  const wb = XLSX.utils.book_new();
+  const sheet1 = XLSX.utils.json_to_sheet(lastDocRows);
+  const sheet2 = XLSX.utils.json_to_sheet(historyRows);
+  const sheet3 = XLSX.utils.json_to_sheet(deltas.map(r=> ({
+    ...r,
+    "Prezzo precedente €": typeof r["Prezzo precedente €"] === "number" ? r["Prezzo precedente €"].toFixed(2) : r["Prezzo precedente €"],
+    "Prezzo nuovo €": typeof r["Prezzo nuovo €"] === "number" ? r["Prezzo nuovo €"].toFixed(2) : r["Prezzo nuovo €"],
+    "Differenza €": typeof r["Differenza €"] === "number" ? r["Differenza €"].toFixed(2) : r["Differenza €"],
+    "Differenza %": typeof r["Differenza %"] === "number" ? r["Differenza %"].toFixed(2) : r["Differenza %"],
+  })));
+
+  sheet1['!cols'] = autoFitCols(lastDocRows);
+  sheet2['!cols'] = autoFitCols(historyRows);
+  sheet3['!cols'] = autoFitCols(deltas);
+
+  XLSX.utils.book_append_sheet(wb, sheet1, `Nuovo documento ${lastDocMeta.data}`.slice(0,31));
+  XLSX.utils.book_append_sheet(wb, sheet2, "Storico aggiornato");
+  XLSX.utils.book_append_sheet(wb, sheet3, "Confronto (variaz + nuovi)");
+
+  XLSX.writeFile(wb, `Confronto_Prezzi_${(lastDocMeta.fornitore||'FORNITORE').replace(/\s+/g,'_')}.xlsx`);
+}
+
+// ===== Stati interni per export =====
+(function patchState(){
+  const _upsert = upsertHistory;
+  window.__lastDocRows = null;
+  window.__lastMeta = null;
+  window.__lastDeltas = null;
+  window.upsertHistory = function(rows, meta){
+    window.__lastDocRows = rows;
+    window.__lastMeta = meta;
+    return _upsert(rows, meta);
+  };
+  const _diff = diffAgainstSnapshot;
+  window.diffAgainstSnapshot = function(prev, rows){
+    const out = _diff(prev, rows);
+    window.__lastDeltas = out;
+    return out;
+  };
+})();
+
+// ===== Handlers =====
+async function onParse(){
+  const input = $("#pdfInput");
+  const supplier = ($("#supplier").value || "").trim() || "Fornitore";
+  const manualDate = $("#manualDate").value || null;
+  const rowRegex = $("#rowRegex").value;
+
+  if (!input.files.length) { alert("Seleziona uno o più PDF."); return; }
+
+  // snapshot history (per confronto corretto)
+  const prevSnapshot = loadStore().map(r=>({ ...r }));
+
+  for (const file of input.files) {
+    const lines = await extractTextLinesFromPDF(file);
+    const rows  = parseRows(lines, rowRegex);
+    if (!rows.length) {
+      alert(`Nessuna riga prodotto riconosciuta in: ${file.name}\nAdatta la regex in Opzioni avanzate.`);
+      continue;
+    }
+    const dataDoc = manualDate || guessDocDate(file.name, lines);
+    // arricchisci (IVA lasciata vuota, se non presente)
+    const enriched = rows.map(r => ({ ...r, "IVA %": "", "Data": dataDoc, "Fornitore": supplier }));
+
+    // diff contro snapshot (prima dell’update)
+    const deltas = diffAgainstSnapshot(prevSnapshot, enriched);
+
+    // UI: ultimo documento
+    $("#lastDocMeta").innerHTML = `<div class="hint">Documento: <b>${file.name}</b> — Fornitore: <b>${supplier}</b> — Data: <b>${dataDoc}</b> — Righe estratte: <b>${enriched.length}</b></div>`;
+    autoTable($("#tableLastDoc"), enriched);
+
+    // aggiorna storico (post-diff)
+    const updatedHist = upsertHistory(enriched, { data: dataDoc, fornitore: supplier });
+    autoTable($("#tableHistory"), updatedHist);
+
+    // confronto
+    autoTable($("#tableDelta"), deltas.map(d => ({
+      ...d,
+      "Prezzo precedente €": typeof d["Prezzo precedente €"] === "number" ? fmtEUR(d["Prezzo precedente €"]) : d["Prezzo precedente €"],
+      "Prezzo nuovo €": typeof d["Prezzo nuovo €"] === "number" ? fmtEUR(d["Prezzo nuovo €"]) : d["Prezzo nuovo €"],
+      "Differenza €": typeof d["Differenza €"] === "number" ? fmtEUR(d["Differenza €"]) : d["Differenza €"],
+      "Differenza %": typeof d["Differenza %"] === "number" ? d["Differenza %"].toFixed(2) + "%" : d["Differenza %"],
+    })));
   }
 }
 
-// Handler bottone
-document.querySelector('#goBtn').addEventListener('click', async ()=>{
-  try{
-    const file = document.querySelector('#file').files?.[0];
-    if(!file){ setErr('Seleziona un file.'); return; }
-    const text = await runOCR(file, document.querySelector('#psm').value);
-    document.querySelector('#raw').value = text;
-    // TODO: invoca il parser qui quando vuoi
-  } catch(err){
-    setErr('Errore: '+(err?.message||err));
-    log('FATAL', err?.stack||err);
+function onExport(){
+  if (!window.__lastDocRows || !window.__lastMeta) {
+    alert("Importa almeno un documento prima di esportare.");
+    return;
   }
-});// ========= UI =========
-$('#goBtn').addEventListener('click', async () => {
-  const file = $('#file').files?.[0];
-  if(!file){ setErr('Seleziona un file immagine o PDF.'); return;}
-  await runOCR(file, {
-    model: $('#model').value,
-    psm: $('#psm').value,
-    numericPass: $('#numericPass').checked
+  exportExcel({
+    lastDocRows: window.__lastDocRows,
+    lastDocMeta: window.__lastMeta,
+    historyRows: loadStore(),
+    deltas: window.__lastDeltas || []
   });
-});
-
-$('#demoBtn').addEventListener('click', async () => {
-  // Demo minima (pixel) per test pipeline
-  const demoBase64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNk+M8ABgADmBzq4GqVvQAAAABJRU5ErkJggg==';
-  const bin = atob(demoBase64); const arr = new Uint8Array(bin.length);
-  for(let i=0;i<bin.length;i++) arr[i]=bin.charCodeAt(i);
-  const demoFile = new File([new Blob([arr],{type:'image/png'})], 'demo.png', {type:'image/png'});
-  await runOCR(demoFile, { model: $('#model').value, psm: $('#psm').value, numericPass: $('#numericPass').checked });
-});
-
-function renderRows(rows){
-  const tb = $('#outTable tbody'); tb.innerHTML = '';
-  rows.forEach((r,i)=>{
-    const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${i+1}</td><td>${escapeHtml(r.desc)}</td><td>${r.prezzo ?? ''}</td><td>${r.iva ?? ''}</td>`;
-    tb.appendChild(tr);
-  });
-  $('#csvBtn').disabled = rows.length===0;
 }
 
-$('#csvBtn').addEventListener('click', ()=>{
-  const rows = [...document.querySelectorAll('#outTable tbody tr')].map(tr=>{
-    const tds = tr.querySelectorAll('td');
-    return [tds[1].textContent, tds[2].textContent, tds[3].textContent];
-  });
-  const csv = 'Descrizione,Prezzo (€),IVA (%)\n' + rows.map(r=>r.map(s=>`"${s.replace(/"/g,'""')}"`).join(',')).join('\n');
-  const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
-  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'estrai-prezzi.csv'; a.click();
+// ===== Bind =====
+$("#btnParse").addEventListener("click", onParse);
+$("#btnExportExcel").addEventListener("click", onExport);
+$("#btnClearLast").addEventListener("click", ()=>{
+  undoLastImport();
+  autoTable($("#tableHistory"), loadStore());
+  $("#tableDelta").innerHTML="";
 });
-
-function escapeHtml(s){return (s??'').replace(/[&<>"']/g, m=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[m]));}
+$("#btnResetAll").addEventListener("click", ()=>{
+  if (confirm("Azzerare definitivamente lo storico?")) {
+    localStorage.removeItem(STORE_KEY);
+    localStorage.removeItem(IMPORT_LOG);
+    $("#tableHistory").innerHTML="";
+    $("#tableDelta").innerHTML="";
+    $("#tableLastDoc").innerHTML="";
+    $("#lastDocMeta").innerHTML="";
+  }
+});
